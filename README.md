@@ -16,8 +16,9 @@ Most guitarists just want to plug in and sound good. You don't need a 2 GB
 amp suite for that — a whole tube-style amp fits in **42 KB of WASM** and
 runs in a browser tab at 128-sample latency.
 
-openamp-dsp is the amp core behind **OpenAmp** (free browser amp, demo at
-launch): 4 voicings, staged asymmetric saturation with real anti-aliasing,
+openamp-dsp is the amp core behind
+**[OpenAmp — try it live](https://adamperlinski.github.io/openamp/)**:
+4 voicings, staged asymmetric saturation with real anti-aliasing,
 a noise gate that doesn't eat pick attack, and a 3-band tonestack. Pure
 Rust, zero dependencies, zero allocation in the audio path. The same crate
 compiles to `wasm32` for an AudioWorklet or native for desktop.

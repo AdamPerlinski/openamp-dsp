@@ -5,12 +5,18 @@
 // allocation after init. The worklet copies input into IN_BUF, calls
 // process(n), reads OUT_BUF. Blocks are ≤128 frames (one render quantum).
 //
-// v1 voicing "crunch": tight HPF → two asymmetric tanh stages with an
-// inter-stage fizz LPF → 3-band tonestack (RBJ biquads) → soft power-amp
-// clip → master. Params are smoothed to avoid zipper noise.
+// Chain (docs/TONE.md): 20 Hz DC HPF → voicing tightness HPF → noise gate
+// (pre-drive, hysteresis + hold) → pre-gain → up to 3 asymmetric tanh stages
+// with interstage HPF/LPF → anti-fizz LPF → 3-band tonestack + fixed voicing
+// EQ → power tanh → presence shelf → 10 Hz DC blocker → master.
+// Every biased stage uses tanh(k·x+b) − tanh(b) so no DC leaks downstream.
+//
+// Params: 0 drive 0..1 · 1 bass dB · 2 mid dB · 3 treble dB · 4 master 0..1.5
+//         5 voicing 0..3 · 6 gate on/off · 7 gate threshold dB · 8 presence dB
 
 const MAX_BLOCK: usize = 128;
 const PI: f32 = core::f32::consts::PI;
+const OUT_SCALE: f32 = 0.4; // headroom: worklet peaks stay well under 0 dBFS
 
 static mut IN_BUF: [f32; MAX_BLOCK] = [0.0; MAX_BLOCK];
 static mut OUT_BUF: [f32; MAX_BLOCK] = [0.0; MAX_BLOCK];
@@ -38,6 +44,10 @@ impl Biquad {
         self.b2 = b2 / a0;
         self.a1 = a1 / a0;
         self.a2 = a2 / a0;
+    }
+
+    fn bypass(&mut self) {
+        self.set(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
     }
 
     fn low_shelf(&mut self, fs: f32, f0: f32, db: f32) {
@@ -88,7 +98,7 @@ impl Biquad {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct OnePoleHp {
     a: f32,
     x1: f32,
@@ -108,7 +118,7 @@ impl OnePoleHp {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct OnePoleLp {
     a: f32,
     y1: f32,
@@ -125,12 +135,224 @@ impl OnePoleLp {
     }
 }
 
-const STAGE1_BIAS: f32 = 0.12; // asymmetry → even harmonics
+// One tanh stage: y = (tanh(k·x + b) − tanh(b)) · post
+#[derive(Clone, Copy)]
+struct Stage {
+    k: f32,
+    bias: f32,
+    post: f32,
+}
 
-#[derive(Default)]
+impl Stage {
+    #[inline(always)]
+    fn tick(&self, x: f32) -> f32 {
+        ((self.k * x + self.bias).tanh() - self.bias.tanh()) * self.post
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EqKind {
+    Peak,
+    HighShelf,
+}
+
+#[derive(Clone, Copy)]
+struct FixedEq {
+    kind: EqKind,
+    f: f32,
+    q: f32,
+    db: f32,
+}
+
+// Per-voicing topology (docs/TONE.md §1.3)
+struct Voicing {
+    input_hpf: f32,
+    pre_lo_db: f32,
+    pre_hi_db: f32,
+    stages: [Option<Stage>; 3],
+    is_hpf: [Option<f32>; 2], // before stage 2, before stage 3
+    is_lpf: [Option<f32>; 2],
+    fizz_lpf: f32,
+    ts_low_f: f32,
+    ts_mid_f: f32,
+    ts_mid_q: f32,
+    ts_high_f: f32,
+    fixed_eq: [Option<FixedEq>; 2],
+    power: Stage,
+    gate_thresh_db: f32, // default gate threshold for this voicing
+}
+
+fn voicing_cfg(id: u32) -> Voicing {
+    match id {
+        // CLEAN — blackface sparkle, headroom, gentle squash
+        0 => Voicing {
+            input_hpf: 60.0,
+            pre_lo_db: -6.0,
+            pre_hi_db: 14.0,
+            stages: [Some(Stage { k: 0.55, bias: 0.03, post: 1.0 / 0.55 }), None, None],
+            is_hpf: [None, None],
+            is_lpf: [None, None],
+            fizz_lpf: 9000.0,
+            ts_low_f: 100.0,
+            ts_mid_f: 480.0,
+            ts_mid_q: 0.6,
+            ts_high_f: 4500.0,
+            fixed_eq: [
+                Some(FixedEq { kind: EqKind::HighShelf, f: 7000.0, q: 0.71, db: 2.0 }),
+                Some(FixedEq { kind: EqKind::Peak, f: 400.0, q: 1.0, db: -1.5 }),
+            ],
+            power: Stage { k: 0.8, bias: 0.0, post: 1.0 / 0.8 },
+            gate_thresh_db: -50.0,
+        },
+        // EDGE — tweed breakup, cleans up with soft picking
+        1 => Voicing {
+            input_hpf: 80.0,
+            pre_lo_db: 0.0,
+            pre_hi_db: 22.0,
+            stages: [
+                Some(Stage { k: 1.0, bias: 0.10, post: 1.0 }),
+                Some(Stage { k: 1.4, bias: 0.06, post: 1.0 }),
+                None,
+            ],
+            is_hpf: [Some(120.0), None],
+            is_lpf: [None, None],
+            fizz_lpf: 8000.0,
+            ts_low_f: 100.0,
+            ts_mid_f: 550.0,
+            ts_mid_q: 0.7,
+            ts_high_f: 3800.0,
+            fixed_eq: [None, None],
+            power: Stage { k: 1.0, bias: 0.0, post: 1.0 },
+            gate_thresh_db: -50.0,
+        },
+        // CRUNCH — Marshall midrange bark
+        2 => Voicing {
+            input_hpf: 100.0,
+            pre_lo_db: 6.0,
+            pre_hi_db: 32.0,
+            stages: [
+                Some(Stage { k: 1.0, bias: 0.12, post: 1.0 }),
+                Some(Stage { k: 1.8, bias: 0.08, post: 1.0 }),
+                Some(Stage { k: 1.2, bias: 0.05, post: 1.0 }),
+            ],
+            is_hpf: [Some(120.0), None],
+            is_lpf: [Some(7500.0), Some(6800.0)],
+            fizz_lpf: 7200.0,
+            ts_low_f: 110.0,
+            ts_mid_f: 800.0,
+            ts_mid_q: 0.7,
+            ts_high_f: 3500.0,
+            fixed_eq: [Some(FixedEq { kind: EqKind::Peak, f: 750.0, q: 1.4, db: 2.0 }), None],
+            power: Stage { k: 1.2, bias: 0.0, post: 1.0 },
+            gate_thresh_db: -48.0,
+        },
+        // HIGH-GAIN — tight modern metal
+        _ => Voicing {
+            input_hpf: 210.0,
+            pre_lo_db: 18.0,
+            pre_hi_db: 44.0,
+            stages: [
+                Some(Stage { k: 1.0, bias: 0.12, post: 1.0 }),
+                Some(Stage { k: 1.8, bias: -0.08, post: 1.0 }), // alternating asymmetry
+                Some(Stage { k: 1.5, bias: 0.10, post: 1.0 }),
+            ],
+            is_hpf: [Some(140.0), Some(110.0)],
+            is_lpf: [Some(6000.0), Some(5600.0)],
+            fizz_lpf: 6800.0,
+            ts_low_f: 120.0,
+            ts_mid_f: 650.0,
+            ts_mid_q: 0.9,
+            ts_high_f: 3200.0,
+            fixed_eq: [Some(FixedEq { kind: EqKind::Peak, f: 450.0, q: 1.2, db: -2.0 }), None],
+            power: Stage { k: 1.2, bias: 0.0, post: 1.0 },
+            gate_thresh_db: -43.0,
+        },
+    }
+}
+
+// Noise gate: pre-drive, hysteresis + hold, exponential close (docs/TONE.md §1.2)
+struct Gate {
+    enabled: bool,
+    open_thresh: f32,  // linear
+    close_thresh: f32, // linear (open − 6 dB)
+    env: f32,
+    att: f32,       // detector attack coef (0.5 ms)
+    rel: f32,       // detector release coef (30 ms)
+    gain: f32,
+    open: bool,
+    hold_left: i32,
+    hold_samples: i32, // 40 ms
+    open_coef: f32,    // 0.15 ms ramp
+    close_coef: f32,   // 90 ms exponential
+}
+
+const GATE_FLOOR: f32 = 1e-4; // −80 dB, not −∞
+
+impl Gate {
+    fn new(fs: f32) -> Self {
+        Gate {
+            enabled: false,
+            open_thresh: db_to_lin(-50.0),
+            close_thresh: db_to_lin(-56.0),
+            env: 0.0,
+            att: 1.0 - (-1.0 / (0.0005 * fs)).exp(),
+            rel: 1.0 - (-1.0 / (0.030 * fs)).exp(),
+            gain: 1.0,
+            open: true,
+            hold_left: 0,
+            hold_samples: (0.040 * fs) as i32,
+            open_coef: 1.0 - (-1.0 / (0.00015 * fs)).exp(),
+            close_coef: 1.0 - (-1.0 / (0.090 * fs)).exp(),
+        }
+    }
+
+    fn set_thresh_db(&mut self, db: f32) {
+        self.open_thresh = db_to_lin(db);
+        self.close_thresh = db_to_lin(db - 6.0);
+    }
+
+    #[inline(always)]
+    fn tick(&mut self, x: f32) -> f32 {
+        if !self.enabled {
+            return x;
+        }
+        let a = x.abs();
+        let coef = if a > self.env { self.att } else { self.rel };
+        self.env += coef * (a - self.env);
+
+        if self.open {
+            if self.env < self.close_thresh {
+                self.hold_left -= 1;
+                if self.hold_left <= 0 {
+                    self.open = false;
+                }
+            } else {
+                self.hold_left = self.hold_samples;
+            }
+        } else if self.env > self.open_thresh {
+            self.open = true;
+            self.hold_left = self.hold_samples;
+        }
+
+        let (target, coef) = if self.open {
+            (1.0, self.open_coef)
+        } else {
+            (GATE_FLOOR, self.close_coef)
+        };
+        self.gain += coef * (target - self.gain);
+        x * self.gain
+    }
+}
+
+fn db_to_lin(db: f32) -> f32 {
+    10f32.powf(db / 20.0)
+}
+
 struct Amp {
     fs: f32,
-    // targets (set_param) and smoothed current values
+    voicing_id: u32,
+    v: Voicing,
+
     drive: f32,
     master: f32,
     pre_gain: f32,
@@ -139,59 +361,129 @@ struct Amp {
     bass_db: f32,
     mid_db: f32,
     treble_db: f32,
+    presence_db: f32,
     eq_dirty: bool,
+    user_gate_thresh: Option<f32>,
 
-    hp_dc: OnePoleHp,
+    gate: Gate,
+    hp_dc_in: OnePoleHp,
     hp_tight: OnePoleHp,
+    is_hp: [OnePoleHp; 2],
+    is_lp: [OnePoleLp; 2],
     lp_fizz: OnePoleLp,
     eq_bass: Biquad,
     eq_mid: Biquad,
     eq_treble: Biquad,
-    bias_off: f32,
+    eq_fixed: [Biquad; 2],
+    eq_presence: Biquad,
+    dc_block: OnePoleHp,
 }
 
 impl Amp {
     fn new(fs: f32) -> Self {
         let mut a = Amp {
             fs,
-            drive: 0.4,
+            voicing_id: 2,
+            v: voicing_cfg(2),
+            drive: 0.5,
             master: 0.8,
+            pre_gain: 1.0,
+            cur_pre: 1.0,
+            cur_master: 0.8,
+            bass_db: 0.0,
+            mid_db: 0.0,
+            treble_db: 0.0,
+            presence_db: 3.0,
             eq_dirty: true,
-            bias_off: STAGE1_BIAS.tanh(),
-            ..Default::default()
+            user_gate_thresh: None,
+            gate: Gate::new(fs),
+            hp_dc_in: Default::default(),
+            hp_tight: Default::default(),
+            is_hp: Default::default(),
+            is_lp: Default::default(),
+            lp_fizz: Default::default(),
+            eq_bass: Default::default(),
+            eq_mid: Default::default(),
+            eq_treble: Default::default(),
+            eq_fixed: Default::default(),
+            eq_presence: Default::default(),
+            dc_block: Default::default(),
         };
-        a.hp_dc.set(fs, 20.0);
-        a.hp_tight.set(fs, 90.0);
-        a.lp_fizz.set(fs, 6500.0);
-        a.pre_gain = Self::drive_to_gain(a.drive);
-        a.cur_pre = a.pre_gain;
-        a.cur_master = a.master;
+        a.hp_dc_in.set(fs, 20.0);
+        a.dc_block.set(fs, 10.0);
+        a.apply_voicing();
         a
     }
 
-    fn drive_to_gain(drive: f32) -> f32 {
-        // 0..1 → -6..+40 dB of pre-gain
-        10f32.powf((-6.0 + drive * 46.0) / 20.0)
+    fn apply_voicing(&mut self) {
+        let v = &self.v;
+        self.hp_tight.set(self.fs, v.input_hpf);
+        for i in 0..2 {
+            if let Some(f) = v.is_hpf[i] {
+                self.is_hp[i].set(self.fs, f);
+            }
+            if let Some(f) = v.is_lpf[i] {
+                self.is_lp[i].set(self.fs, f);
+            }
+        }
+        self.lp_fizz.set(self.fs, v.fizz_lpf);
+        for i in 0..2 {
+            match v.fixed_eq[i] {
+                Some(e) => match e.kind {
+                    EqKind::Peak => self.eq_fixed[i].peaking(self.fs, e.f, e.q, e.db),
+                    EqKind::HighShelf => self.eq_fixed[i].high_shelf(self.fs, e.f, e.db),
+                },
+                None => self.eq_fixed[i].bypass(),
+            }
+        }
+        let thresh = self.user_gate_thresh.unwrap_or(v.gate_thresh_db);
+        self.gate.set_thresh_db(thresh);
+        self.pre_gain = self.drive_to_gain();
+        self.eq_dirty = true;
     }
 
-    fn set_param(&mut self, id: u32, v: f32) {
+    fn drive_to_gain(&self) -> f32 {
+        let db = self.v.pre_lo_db + self.drive * (self.v.pre_hi_db - self.v.pre_lo_db);
+        db_to_lin(db)
+    }
+
+    fn set_param(&mut self, id: u32, val: f32) {
         match id {
             0 => {
-                self.drive = v.clamp(0.0, 1.0);
-                self.pre_gain = Self::drive_to_gain(self.drive);
+                self.drive = val.clamp(0.0, 1.0);
+                self.pre_gain = self.drive_to_gain();
             }
-            1 => { self.bass_db = v.clamp(-12.0, 12.0); self.eq_dirty = true; }
-            2 => { self.mid_db = v.clamp(-12.0, 12.0); self.eq_dirty = true; }
-            3 => { self.treble_db = v.clamp(-12.0, 12.0); self.eq_dirty = true; }
-            4 => self.master = v.clamp(0.0, 1.5),
+            1 => { self.bass_db = val.clamp(-12.0, 12.0); self.eq_dirty = true; }
+            2 => { self.mid_db = val.clamp(-12.0, 12.0); self.eq_dirty = true; }
+            3 => { self.treble_db = val.clamp(-12.0, 12.0); self.eq_dirty = true; }
+            4 => self.master = val.clamp(0.0, 1.5),
+            5 => {
+                let id = (val as u32).min(3);
+                if id != self.voicing_id {
+                    self.voicing_id = id;
+                    self.v = voicing_cfg(id);
+                    self.apply_voicing();
+                }
+            }
+            6 => self.gate.enabled = val > 0.5,
+            7 => {
+                self.user_gate_thresh = Some(val.clamp(-70.0, -20.0));
+                self.gate.set_thresh_db(val.clamp(-70.0, -20.0));
+            }
+            8 => { self.presence_db = val.clamp(0.0, 6.0); self.eq_dirty = true; }
             _ => {}
         }
     }
 
     fn update_eq(&mut self) {
-        self.eq_bass.low_shelf(self.fs, 110.0, self.bass_db);
-        self.eq_mid.peaking(self.fs, 550.0, 0.8, self.mid_db);
-        self.eq_treble.high_shelf(self.fs, 3200.0, self.treble_db);
+        let v = &self.v;
+        self.eq_bass.low_shelf(self.fs, v.ts_low_f, self.bass_db);
+        self.eq_mid.peaking(self.fs, v.ts_mid_f, v.ts_mid_q, self.mid_db);
+        // cap the high-gain treble shelf: post-distortion boosts above +8 dB
+        // are a wasp factory (anti-fizz checklist #7)
+        let treble = if self.voicing_id == 3 { self.treble_db.min(8.0) } else { self.treble_db };
+        self.eq_treble.high_shelf(self.fs, v.ts_high_f, treble);
+        self.eq_presence.high_shelf(self.fs, 4600.0, self.presence_db);
         self.eq_dirty = false;
     }
 
@@ -199,24 +491,42 @@ impl Amp {
         if self.eq_dirty {
             self.update_eq();
         }
+        let v_stages = self.v.stages;
+        let has_is_hp = [self.v.is_hpf[0].is_some(), self.v.is_hpf[1].is_some()];
+        let has_is_lp = [self.v.is_lpf[0].is_some(), self.v.is_lpf[1].is_some()];
+        let power = self.v.power;
+
         for (o, &s) in out.iter_mut().zip(input.iter()) {
-            // param smoothing (~ms-scale, per sample)
             self.cur_pre += 0.004 * (self.pre_gain - self.cur_pre);
             self.cur_master += 0.004 * (self.master - self.cur_master);
 
-            let mut x = self.hp_dc.tick(s);
+            let mut x = self.hp_dc_in.tick(s);
             x = self.hp_tight.tick(x);
+            x = self.gate.tick(x);
             x *= self.cur_pre;
-            // stage 1: asymmetric clip
-            x = (x + STAGE1_BIAS).tanh() - self.bias_off;
+
+            if let Some(st) = v_stages[0] {
+                x = st.tick(x);
+            }
+            if let Some(st) = v_stages[1] {
+                if has_is_hp[0] { x = self.is_hp[0].tick(x); }
+                if has_is_lp[0] { x = self.is_lp[0].tick(x); }
+                x = st.tick(x);
+            }
+            if let Some(st) = v_stages[2] {
+                if has_is_hp[1] { x = self.is_hp[1].tick(x); }
+                if has_is_lp[1] { x = self.is_lp[1].tick(x); }
+                x = st.tick(x);
+            }
+
             x = self.lp_fizz.tick(x);
-            // stage 2: symmetric, harder
-            x = (1.8 * x).tanh();
-            // tonestack
             x = self.eq_treble.tick(self.eq_mid.tick(self.eq_bass.tick(x)));
-            // power amp: gentle squash
-            x = (1.2 * x).tanh();
-            *o = x * self.cur_master;
+            x = self.eq_fixed[0].tick(x);
+            x = self.eq_fixed[1].tick(x);
+            x = power.tick(x);
+            x = self.eq_presence.tick(x);
+            x = self.dc_block.tick(x);
+            *o = x * self.cur_master * OUT_SCALE;
         }
     }
 }
@@ -279,41 +589,69 @@ mod tests {
         (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt()
     }
 
-    #[test]
-    fn silence_in_silence_out() {
-        let mut amp = Amp::new(FS);
-        let out = run(&mut amp, &vec![0.0; 48000]);
-        assert_all_finite(&out);
-        // after the smoothing settles there must be no self-noise / DC
-        assert!(rms(&out[24000..]) < 1e-4, "amp generates output from silence");
+    fn mean(v: &[f32]) -> f32 {
+        v.iter().sum::<f32>() / v.len() as f32
     }
 
     #[test]
-    fn guitar_level_sine_passes_sanely() {
-        let mut amp = Amp::new(FS);
-        let out = run(&mut amp, &sine(82.4, 0.1, 1.0)); // low E, DI level
-        assert_all_finite(&out);
-        let tail = &out[24000..];
-        let r = rms(tail);
-        assert!(r > 0.01, "output too quiet: rms {r}");
-        assert!(tail.iter().all(|x| x.abs() <= 1.5), "output exceeds ±1.5");
+    fn silence_in_silence_out_all_voicings() {
+        for voicing in 0..4 {
+            let mut amp = Amp::new(FS);
+            amp.set_param(5, voicing as f32);
+            let out = run(&mut amp, &vec![0.0; 48000]);
+            assert_all_finite(&out);
+            assert!(
+                rms(&out[24000..]) < 1e-4,
+                "voicing {voicing} generates output from silence"
+            );
+        }
+    }
+
+    #[test]
+    fn guitar_level_sine_passes_sanely_all_voicings() {
+        for voicing in 0..4 {
+            let mut amp = Amp::new(FS);
+            amp.set_param(5, voicing as f32);
+            let out = run(&mut amp, &sine(220.0, 0.1, 1.0));
+            assert_all_finite(&out);
+            let tail = &out[24000..];
+            let r = rms(tail);
+            assert!(r > 0.005, "voicing {voicing} too quiet: rms {r}");
+            assert!(tail.iter().all(|x| x.abs() <= 1.0), "voicing {voicing} exceeds ±1.0");
+        }
+    }
+
+    #[test]
+    fn no_dc_offset_at_any_drive() {
+        // biased tanh stages must not leak DC (anti-fizz checklist #6)
+        for voicing in 0..4 {
+            for drive in [0.0, 0.5, 1.0] {
+                let mut amp = Amp::new(FS);
+                amp.set_param(5, voicing as f32);
+                amp.set_param(0, drive);
+                let out = run(&mut amp, &sine(110.0, 0.1, 1.0));
+                let dc = mean(&out[24000..]).abs();
+                assert!(dc < 0.005, "voicing {voicing} drive {drive}: DC {dc}");
+            }
+        }
     }
 
     #[test]
     fn extreme_settings_stay_bounded() {
         let mut amp = Amp::new(FS);
-        amp.set_param(0, 1.0); // full drive
+        amp.set_param(5, 3.0);
+        amp.set_param(0, 1.0);
         amp.set_param(1, 12.0);
         amp.set_param(2, 12.0);
         amp.set_param(3, 12.0);
         amp.set_param(4, 1.5);
-        // hostile input: full-scale square wave 110 Hz
+        amp.set_param(8, 6.0);
         let sq: Vec<f32> = (0..96000)
             .map(|i| if (i as f32 * 110.0 / FS).fract() < 0.5 { 1.0 } else { -1.0 })
             .collect();
         let out = run(&mut amp, &sq);
         assert_all_finite(&out);
-        assert!(out.iter().all(|x| x.abs() <= 2.0), "unbounded output");
+        assert!(out.iter().all(|x| x.abs() <= 1.5), "unbounded output");
     }
 
     #[test]
@@ -322,29 +660,81 @@ mod tests {
         amp.set_param(1, -12.0);
         amp.set_param(2, 12.0);
         amp.set_param(3, -12.0);
+        amp.set_param(8, 6.0);
         let mut input = vec![0.0f32; 96000];
-        input[0] = 1.0; // impulse
+        input[0] = 1.0;
         let out = run(&mut amp, &input);
         assert_all_finite(&out);
-        // response must decay: last half-second essentially silent
         assert!(rms(&out[72000..]) < 1e-5, "filter ringing does not decay");
     }
 
     #[test]
     fn param_changes_do_not_click() {
         let mut amp = Amp::new(FS);
-        let input = sine(196.0, 0.1, 2.0); // G3
+        let input = sine(196.0, 0.1, 2.0);
         let mut out = vec![0.0f32; input.len()];
         for (i, (ic, oc)) in input.chunks(MAX_BLOCK).zip(out.chunks_mut(MAX_BLOCK)).enumerate() {
             if i == 200 {
-                amp.set_param(0, 0.9); // slam drive mid-stream
+                amp.set_param(0, 0.9);
                 amp.set_param(4, 1.2);
             }
             amp.process(ic, oc);
         }
         assert_all_finite(&out);
-        // no sample-to-sample discontinuity beyond what the waveform allows
         let max_step = out.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
         assert!(max_step < 0.35, "audible click on param change: step {max_step}");
+    }
+
+    #[test]
+    fn gate_blocks_hum_passes_signal() {
+        let mut amp = Amp::new(FS);
+        amp.set_param(5, 3.0); // high-gain: where the gate matters
+        amp.set_param(6, 1.0); // gate on
+        amp.set_param(7, -43.0);
+
+        // hum only: 50 Hz at −60 dBFS → must be gated to (near) silence
+        let hum = sine(50.0, 0.001, 1.0);
+        let out_hum = run(&mut amp, &hum);
+        assert!(rms(&out_hum[24000..]) < 1e-3, "gate lets −60 dB hum through");
+
+        // real signal: −20 dBFS pluck → must pass
+        let mut amp2 = Amp::new(FS);
+        amp2.set_param(5, 3.0);
+        amp2.set_param(6, 1.0);
+        amp2.set_param(7, -43.0);
+        let sig = sine(110.0, 0.1, 1.0);
+        let out_sig = run(&mut amp2, &sig);
+        assert!(rms(&out_sig[24000..]) > 0.01, "gate blocks a real signal");
+    }
+
+    #[test]
+    fn gate_opens_fast_enough_for_pick_attack() {
+        let mut amp = Amp::new(FS);
+        amp.set_param(5, 3.0);
+        amp.set_param(6, 1.0);
+        // silence, then a pluck: the note must be audible within 2 ms
+        let mut input = vec![0.0f32; 24000];
+        input.extend(sine(110.0, 0.15, 0.5));
+        let out = run(&mut amp, &input);
+        let attack_zone = &out[24000..24000 + 96]; // first 2 ms of the pluck
+        assert!(
+            attack_zone.iter().any(|x| x.abs() > 0.01),
+            "gate smears the pick attack"
+        );
+    }
+
+    #[test]
+    fn voicing_switch_mid_signal_is_safe() {
+        let mut amp = Amp::new(FS);
+        let input = sine(196.0, 0.1, 2.0);
+        let mut out = vec![0.0f32; input.len()];
+        for (i, (ic, oc)) in input.chunks(MAX_BLOCK).zip(out.chunks_mut(MAX_BLOCK)).enumerate() {
+            if i % 100 == 99 {
+                amp.set_param(5, ((i / 100) % 4) as f32);
+            }
+            amp.process(ic, oc);
+        }
+        assert_all_finite(&out);
+        assert!(out.iter().all(|x| x.abs() <= 1.5));
     }
 }

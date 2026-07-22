@@ -1,7 +1,12 @@
 [package]
 name = "openamp-dsp"
-version = "0.1.0"
+version = "1.0.1"
 edition = "2021"
+license = "MIT"
+description = "Guitar amp DSP core: 4 voicings, staged asymmetric tanh with 2x oversampling + ADAA, noise gate, RBJ tonestack. No deps, no alloc in the audio path — runs in an AudioWorklet (wasm32) or native."
+repository = "https://github.com/AdamPerlinski/openamp-dsp"
+keywords = ["audio", "dsp", "guitar", "wasm", "amp"]
+categories = ["multimedia::audio"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]

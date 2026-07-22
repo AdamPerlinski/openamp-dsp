@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="120" viewBox="0 0 480 120">
+  <rect width="480" height="120" rx="16" fill="#0c0d12"/>
+  <!-- tanh curve -->
+  <path d="M 30 78 C 90 78, 110 42, 170 42" fill="none" stroke="#f87171" stroke-width="5" stroke-linecap="round"/>
+  <path d="M 30 78 C 90 78, 110 42, 170 42" fill="none" stroke="#f87171" stroke-width="14" stroke-linecap="round" opacity="0.15"/>
+  <circle cx="30" cy="78" r="6" fill="#f87171"/>
+  <circle cx="170" cy="42" r="6" fill="#f87171"/>
+  <text x="200" y="72" font-family="'Space Grotesk', 'Segoe UI', system-ui, sans-serif" font-size="40" font-weight="700" fill="#f2f4f8">openamp<tspan fill="#f87171">·dsp</tspan></text>
+  <text x="202" y="96" font-family="'Space Grotesk', 'Segoe UI', system-ui, sans-serif" font-size="15" fill="#8b93a7">a tube-style guitar amp in 42 KB of WASM</text>
+</svg>

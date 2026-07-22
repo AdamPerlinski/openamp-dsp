@@ -281,6 +281,7 @@ struct Voicing {
     fixed_eq: [Option<FixedEq>; 2],
     power: Stage,
     gate_thresh_db: f32, // default gate threshold for this voicing
+    makeup_db: f32, // per-voicing loudness makeup so preset cards match (±1 dB)
 }
 
 fn voicing_cfg(id: u32) -> Voicing {
@@ -304,6 +305,7 @@ fn voicing_cfg(id: u32) -> Voicing {
             ],
             power: Stage { k: 0.8, bias: 0.0, post: 1.0 / 0.8 },
             gate_thresh_db: -50.0,
+            makeup_db: 14.0,
         },
         // EDGE — tweed breakup, cleans up with soft picking
         1 => Voicing {
@@ -325,6 +327,7 @@ fn voicing_cfg(id: u32) -> Voicing {
             fixed_eq: [None, None],
             power: Stage { k: 1.0, bias: 0.0, post: 1.0 },
             gate_thresh_db: -50.0,
+            makeup_db: 6.0,
         },
         // CRUNCH — Marshall midrange bark
         2 => Voicing {
@@ -346,6 +349,7 @@ fn voicing_cfg(id: u32) -> Voicing {
             fixed_eq: [Some(FixedEq { kind: EqKind::Peak, f: 750.0, q: 1.4, db: 2.0 }), None],
             power: Stage { k: 1.2, bias: 0.0, post: 1.0 },
             gate_thresh_db: -48.0,
+            makeup_db: 0.0,
         },
         // HIGH-GAIN — tight modern metal
         _ => Voicing {
@@ -367,6 +371,7 @@ fn voicing_cfg(id: u32) -> Voicing {
             fixed_eq: [Some(FixedEq { kind: EqKind::Peak, f: 450.0, q: 1.2, db: -2.0 }), None],
             power: Stage { k: 1.2, bias: 0.0, post: 1.0 },
             gate_thresh_db: -43.0,
+            makeup_db: 0.0,
         },
     }
 }
@@ -465,6 +470,7 @@ struct Amp {
     presence_db: f32,
     eq_dirty: bool,
     user_gate_thresh: Option<f32>,
+    makeup: f32, // linear, from voicing makeup_db
 
     gate: Gate,
     hp_dc_in: OnePoleHp,
@@ -502,6 +508,7 @@ impl Amp {
             presence_db: 3.0,
             eq_dirty: true,
             user_gate_thresh: None,
+            makeup: 1.0,
             gate: Gate::new(fs),
             hp_dc_in: Default::default(),
             hp_tight: Default::default(),
@@ -553,6 +560,7 @@ impl Amp {
         self.power_adaa = AdaaTanh::new(v.power);
         let thresh = self.user_gate_thresh.unwrap_or(v.gate_thresh_db);
         self.gate.set_thresh_db(thresh);
+        self.makeup = db_to_lin(v.makeup_db);
         self.pre_gain = self.drive_to_gain();
         self.eq_dirty = true;
     }
@@ -612,7 +620,7 @@ impl Amp {
 
         for (o, &s) in out.iter_mut().zip(input.iter()) {
             self.cur_pre += 0.004 * (self.pre_gain - self.cur_pre);
-            self.cur_master += 0.004 * (self.master - self.cur_master);
+            self.cur_master += 0.004 * (self.master * self.makeup - self.cur_master);
 
             // base-rate front end
             let mut front = self.hp_dc_in.tick(s);
@@ -859,6 +867,43 @@ mod tests {
             s1 = s0;
         }
         (s1 * s1 + s2 * s2 - coef * s1 * s2) / (v.len() as f32 * v.len() as f32)
+    }
+
+    /// Not a pass/fail test — prints per-card worklet-side loudness so the
+    /// preset `master` values in src/presets.js can be balanced (±1 dB).
+    /// Run: cargo test --target x86_64-unknown-linux-gnu --release \
+    ///        preset_loudness -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn print_preset_loudness() {
+        // params 0..8 of each card in src/presets.js (id → value)
+        let cards: [(&str, [f32; 9]); 7] = [
+            ("sparkle", [0.15, 2.0, -1.0, 3.0, 1.4, 0.0, 0.0, -50.0, 2.0]),
+            ("cozy", [0.10, 3.0, 1.0, -3.0, 1.4, 0.0, 0.0, -50.0, 0.0]),
+            ("gritty", [0.45, 1.0, 1.0, 1.0, 0.85, 1.0, 0.0, -50.0, 2.0]),
+            ("crunchy", [0.55, 0.0, 2.0, 1.0, 0.6, 2.0, 0.0, -48.0, 3.0]),
+            ("heavy", [0.72, 3.0, -3.0, 2.0, 0.55, 3.0, 1.0, -43.0, 4.0]),
+            ("space", [0.12, 1.0, -2.0, 2.0, 1.5, 0.0, 0.0, -50.0, 1.0]),
+            ("fuzz", [1.0, 6.0, -1.0, -2.0, 0.5, 3.0, 1.0, -45.0, 1.0]),
+        ];
+        // guitar-ish test signal: 110 Hz + harmonics, moderate DI level
+        let sig: Vec<f32> = (0..96000)
+            .map(|i| {
+                let t = i as f32 / FS;
+                0.08 * (2.0 * PI * 110.0 * t).sin()
+                    + 0.05 * (2.0 * PI * 220.0 * t).sin()
+                    + 0.03 * (2.0 * PI * 440.0 * t).sin()
+            })
+            .collect();
+        for (name, p) in cards {
+            let mut amp = Amp::new(FS);
+            for (id, v) in p.iter().enumerate() {
+                amp.set_param(id as u32, *v);
+            }
+            let out = run(&mut amp, &sig);
+            let r = rms(&out[48000..]);
+            println!("{name:8} rms {:6.2} dBFS", 20.0 * r.log10());
+        }
     }
 
     #[test]

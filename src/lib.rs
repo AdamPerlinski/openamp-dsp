@@ -250,3 +250,101 @@ pub extern "C" fn process(n: usize) {
         unsafe { amp.process(&IN_BUF[..n], &mut OUT_BUF[..n]) };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FS: f32 = 48000.0;
+
+    fn run(amp: &mut Amp, input: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0f32; input.len()];
+        for (ic, oc) in input.chunks(MAX_BLOCK).zip(out.chunks_mut(MAX_BLOCK)) {
+            amp.process(ic, oc);
+        }
+        out
+    }
+
+    fn sine(freq: f32, amp: f32, secs: f32) -> Vec<f32> {
+        (0..(FS * secs) as usize)
+            .map(|i| amp * (2.0 * PI * freq * i as f32 / FS).sin())
+            .collect()
+    }
+
+    fn assert_all_finite(v: &[f32]) {
+        assert!(v.iter().all(|x| x.is_finite()), "output contains NaN/inf");
+    }
+
+    fn rms(v: &[f32]) -> f32 {
+        (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn silence_in_silence_out() {
+        let mut amp = Amp::new(FS);
+        let out = run(&mut amp, &vec![0.0; 48000]);
+        assert_all_finite(&out);
+        // after the smoothing settles there must be no self-noise / DC
+        assert!(rms(&out[24000..]) < 1e-4, "amp generates output from silence");
+    }
+
+    #[test]
+    fn guitar_level_sine_passes_sanely() {
+        let mut amp = Amp::new(FS);
+        let out = run(&mut amp, &sine(82.4, 0.1, 1.0)); // low E, DI level
+        assert_all_finite(&out);
+        let tail = &out[24000..];
+        let r = rms(tail);
+        assert!(r > 0.01, "output too quiet: rms {r}");
+        assert!(tail.iter().all(|x| x.abs() <= 1.5), "output exceeds ±1.5");
+    }
+
+    #[test]
+    fn extreme_settings_stay_bounded() {
+        let mut amp = Amp::new(FS);
+        amp.set_param(0, 1.0); // full drive
+        amp.set_param(1, 12.0);
+        amp.set_param(2, 12.0);
+        amp.set_param(3, 12.0);
+        amp.set_param(4, 1.5);
+        // hostile input: full-scale square wave 110 Hz
+        let sq: Vec<f32> = (0..96000)
+            .map(|i| if (i as f32 * 110.0 / FS).fract() < 0.5 { 1.0 } else { -1.0 })
+            .collect();
+        let out = run(&mut amp, &sq);
+        assert_all_finite(&out);
+        assert!(out.iter().all(|x| x.abs() <= 2.0), "unbounded output");
+    }
+
+    #[test]
+    fn eq_biquads_are_stable() {
+        let mut amp = Amp::new(FS);
+        amp.set_param(1, -12.0);
+        amp.set_param(2, 12.0);
+        amp.set_param(3, -12.0);
+        let mut input = vec![0.0f32; 96000];
+        input[0] = 1.0; // impulse
+        let out = run(&mut amp, &input);
+        assert_all_finite(&out);
+        // response must decay: last half-second essentially silent
+        assert!(rms(&out[72000..]) < 1e-5, "filter ringing does not decay");
+    }
+
+    #[test]
+    fn param_changes_do_not_click() {
+        let mut amp = Amp::new(FS);
+        let input = sine(196.0, 0.1, 2.0); // G3
+        let mut out = vec![0.0f32; input.len()];
+        for (i, (ic, oc)) in input.chunks(MAX_BLOCK).zip(out.chunks_mut(MAX_BLOCK)).enumerate() {
+            if i == 200 {
+                amp.set_param(0, 0.9); // slam drive mid-stream
+                amp.set_param(4, 1.2);
+            }
+            amp.process(ic, oc);
+        }
+        assert_all_finite(&out);
+        // no sample-to-sample discontinuity beyond what the waveform allows
+        let max_step = out.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(max_step < 0.35, "audible click on param change: step {max_step}");
+    }
+}
